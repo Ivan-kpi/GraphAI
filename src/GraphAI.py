@@ -11,6 +11,39 @@ from langgraph.graph import StateGraph,START,END
 from  langgraph.prebuilt import ToolNode
 import pandas as pd
 
+SYSTEM_PROMPT = """
+You are an LLM agent operating on a local typed graph stored in memory.
+
+The graph consists of:
+- Node tables (one table per node type): Gene, Anatomy, CellType.
+- Edge tables (one table per relation type) with columns:
+  src_id, src_type, dst_id, dst_type, rel_type.
+
+You do NOT have direct access to the graph data.
+All graph operations MUST be performed ONLY via the provided tools.
+
+Your task is to transform a free-form English user request into a sequence of tool calls that:
+1) Determine the ordered node-type path (Type0 -> Type1 -> ... -> TypeN).
+2) Select nodes for each node type (optionally filtered by exact feature values).
+3) Select relation types per step (or use all if unspecified).
+4) Find all paths that match the requested structure.
+5) Save the final tabular result to a CSV file.
+
+Available tools:
+- resolve_nodes
+- find_paths
+- save_csv
+
+Rules:
+- Always use tools for graph operations.
+- Never invent nodes, relations, features, or IDs.
+- If node filters are not specified, use ALL nodes of that type.
+- If relation types are not specified for a step, use ALL relations for that step.
+- Always call save_csv before responding to the user.
+- Do not explain internal reasoning.
+- Do not output raw data unless explicitly requested.
+"""
+
 load_dotenv()
 
 class Graph(TypedDict):
@@ -54,12 +87,11 @@ def init_global_graph(graph_path: str):
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    graph_path: str
 
-def init_graph_node(state: AgentState) -> AgentState:
-    """ First node in the StateGraph. Initialize the global GRAPH """
-    init_global_graph(state["graph_path"])
-    return state
+def init_graph_node(state: AgentState) -> dict:
+    """First node in the StateGraph. Initialize the global GRAPH."""
+    init_global_graph("NodesEdges")
+    return {}
 
 @tool
 def resolve_nodes(
@@ -162,98 +194,117 @@ def find_paths(
     start_nodes: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Find all paths in the global in-memory graph that match a requested
-    node-type sequence.
+    Find all paths in the global in-memory graph (GRAPH) that match a requested
+    sequence of node types, and return the result as a single tabular dataset
+    (one row = one complete path).
 
-    This tool is used after selecting nodes (e.g., via resolve_nodes). It performs
-    step-by-step traversal over edge tables and builds a single tabular result where
-    each row corresponds to one complete path.
+    This tool is typically called after selecting starting nodes via `resolve_nodes`.
+    It performs step-by-step traversal over edge tables using pandas merges.
+
+    IMPORTANT UPDATE (DIRECTION HANDLING)
+    -------------------------------------
+    For each step Type(i) -> Type(i+1), this tool uses edges in BOTH directions:
+    - Forward edges:  src_type == Type(i)   AND dst_type == Type(i+1)
+    - Reverse edges:  src_type == Type(i+1) AND dst_type == Type(i)
+      Reverse edges are inverted (src_id <-> dst_id) so they behave as Type(i) -> Type(i+1).
+
+    This is required because some relations in the provided dataset are stored in the
+    opposite direction of the user-requested path (e.g., Anatomy -> Gene while the
+    user requests Gene -> Anatomy).
 
     INPUTS
     ------
     path_node_types : list[str]
-        The ordered sequence of node types that defines the path shape.
+        Ordered list of node types describing the path shape.
         Example:
             ["Gene", "CellType"]
             ["Gene", "Anatomy", "Anatomy"]
 
-    rel_types_per_step : list[ list[str] | null ] | null
-        Relation constraints per step, with length = len(path_node_types) - 1.
+    rel_types_per_step : list[list[str] | null] | null
+        Optional relation constraints per step. Length must be len(path_node_types) - 1.
 
         - If rel_types_per_step is null:
-            Use ALL relation types available in GRAPH["edges"] between the two node types
-            for each step.
+            Use ALL relations available in GRAPH["edges"] that connect the two types
+            (considering both forward and reverse directions, with reverse inverted).
 
         - If rel_types_per_step is provided:
             For each step i, rel_types_per_step[i] can be:
-              * null  -> use ALL relation types for that step
-              * list[str] -> use ONLY those rel_type values for that step
+              * null       -> use ALL relations for that step (both directions)
+              * list[str]  -> use ONLY those rel_type values for that step (both directions)
 
-        Example for path ["Gene","Anatomy","Anatomy"] (2 steps):
+        Example for ["Gene","Anatomy","Anatomy"] (2 steps):
             rel_types_per_step = [
-                ["EXPRESSES_AeG", "UPREGULATES_AuG"],  # step 0: Gene->Anatomy
-                null                                   # step 1: Anatomy->Anatomy (all)
+                ["EXPRESSES_AeG", "UPREGULATES_AuG"],  # step 0 (Gene <-> Anatomy)
+                null                                    # step 1 (Anatomy <-> Anatomy)
             ]
 
     start_nodes : list[dict] | null
-        Optional starting node set for the first node type in path_node_types.
-        Typically you pass the output of resolve_nodes here (list of node records).
-        If null, the tool uses ALL nodes of the first node type.
+        Optional starting nodes for the first node type in path_node_types.
+        Usually the output of `resolve_nodes` (list of node rows).
+        If null, ALL nodes of the first node type are used.
 
-        Note: only the "node_id" field is required in each dict.
+        Note: only "node_id" is required in each dict; extra keys are ignored.
 
     OUTPUT
     ------
     list[dict]
-        JSON-serializable table: one dict = one path (one row).
+        JSON-serializable table where each dict represents one full path.
 
-        Columns include:
-        - rel_{i}_type for each step i (the edge rel_type used)
-        - all node attributes for each node in the path, prefixed:
-            node_0_<original_node_columns>
-            node_1_<original_node_columns>
+        The output includes:
+        - node_{j}_id columns for each node position j in the path
+        - rel_{i}_type columns for each step i (the relation type used)
+        - ALL node attributes for each node position, prefixed as:
+            node_0_<node_columns>
+            node_1_<node_columns>
             ...
-        Node IDs are stored as:
-            node_0_node_id, node_1_node_id, ...
+          (No node columns are dropped.)
 
     ASSUMPTIONS
     -----------
     - No validation / error handling is performed.
-    - It assumes GRAPH is initialized and contains the requested node/edge tables.
-    - It assumes edge tables contain at least:
-        src_id, src_type, dst_id, dst_type, rel_type
-      and node tables contain node_id (plus any other features).
+    - GRAPH is initialized and contains:
+        GRAPH["nodes"][node_type] dataframes with at least column "node_id"
+        GRAPH["edges"][rel_type] dataframes with at least:
+            src_id, src_type, dst_id, dst_type, rel_type
     """
 
+    # ---- 1) Initial paths (node_0 ids) ----
     first_type = path_node_types[0]
 
     if start_nodes is None:
-        start_df = GRAPH["nodes"][first_type][["node_id"]].copy()
+        paths = GRAPH["nodes"][first_type][["node_id"]].copy()
     else:
-        start_df = pd.DataFrame(start_nodes)[["node_id"]].copy()
+        paths = pd.DataFrame(start_nodes)[["node_id"]].copy()
 
-    paths = start_df.rename(columns={"node_id": "node_0_id"})
+    paths = paths.rename(columns={"node_id": "node_0_id"})
 
-    # Step-by-step traversal and path expansion
+    # ---- 2) Step-by-step traversal ----
     num_steps = len(path_node_types) - 1
 
     for i in range(num_steps):
         src_type = path_node_types[i]
         dst_type = path_node_types[i + 1]
 
-        # Build one edge dataframe for this step by scanning all edge tables
         step_edges_list = []
-        for _, edf in GRAPH["edges"].items():
-            # Filter by direction and types using edge columns
-            part = edf[(edf["src_type"] == src_type) & (edf["dst_type"] == dst_type)]
 
-            # Optional relation filter for this step
+        for _, edf in GRAPH["edges"].items():
+            # FORWARD edges: src_type -> dst_type
+            fwd = edf[(edf["src_type"] == src_type) & (edf["dst_type"] == dst_type)]
+            fwd = fwd[["src_id", "dst_id", "rel_type"]]
+
+            # REVERSE edges: dst_type -> src_type, invert them to behave like src_type -> dst_type
+            rev = edf[(edf["src_type"] == dst_type) & (edf["dst_type"] == src_type)]
+            rev = rev[["src_id", "dst_id", "rel_type"]].rename(columns={"src_id": "dst_id", "dst_id": "src_id"})
+
+            # Optional per-step relation filter
             if rel_types_per_step is not None:
                 rels_i = rel_types_per_step[i]
                 if rels_i is not None:
-                    part = part[part["rel_type"].isin(rels_i)]
+                    fwd = fwd[fwd["rel_type"].isin(rels_i)]
+                    rev = rev[rev["rel_type"].isin(rels_i)]
 
-            step_edges_list.append(part[["src_id", "dst_id", "rel_type"]])
+            step_edges_list.append(fwd)
+            step_edges_list.append(rev)
 
         step_edges = pd.concat(step_edges_list, ignore_index=True)
 
@@ -261,29 +312,31 @@ def find_paths(
         step_edges = step_edges.rename(
             columns={
                 "src_id": f"node_{i}_id",
-                "dst_id": f"node_{i+1}_id",
+                "dst_id": f"node_{i + 1}_id",
                 "rel_type": f"rel_{i}_type",
             }
         )
 
-        # Expand paths by joining on the current node id
+        # Expand paths
         paths = paths.merge(step_edges, on=f"node_{i}_id", how="inner")
 
-    # Enrich with ALL node columns for each position (prefixed)
+    # ---- 3) Enrich with ALL node columns per position (clean version) ----
     for j, ntype in enumerate(path_node_types):
         ndf = GRAPH["nodes"][ntype].copy()
 
-        # Prefix all columns to avoid collisions across different node types/positions
+        # Rename join key to match path column
         ndf = ndf.rename(columns={"node_id": f"node_{j}_id"})
-        ndf = ndf.add_prefix(f"node_{j}_")
 
-        # But after add_prefix, join key became "node_{j}_node_{j}_id"; fix it:
-        # rename "node_0_node_0_id" -> "node_0_id"
-        ndf = ndf.rename(columns={f"node_{j}_node_{j}_id": f"node_{j}_id"})
+        # Prefix all OTHER columns
+        rename_map = {}
+        for col in ndf.columns:
+            if col != f"node_{j}_id":
+                rename_map[col] = f"node_{j}_{col}"
+        ndf = ndf.rename(columns=rename_map)
 
+        # Join
         paths = paths.merge(ndf, on=f"node_{j}_id", how="left")
 
-    # Return as JSON-serializable records
     return paths.to_dict(orient="records")
 
 @tool
@@ -339,4 +392,73 @@ def save_csv(data: List[Dict], output_dir: str = "results") -> str:
 
     return str(filepath)
 
-model = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+tools = [resolve_nodes, find_paths, save_csv]
+
+tool_node = ToolNode(tools=tools)
+
+model = ChatOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    model='gpt-4o-mini',
+    temperature=0
+).bind_tools(tools)
+
+def model_call(state: AgentState) -> AgentState:
+    system_message = SystemMessage(content=SYSTEM_PROMPT)
+
+    response = model.invoke(
+        [system_message] + list(state["messages"])
+    )
+
+    return {
+        "messages": [response]
+    }
+
+def should_continue(state: AgentState):
+    last_message = state["messages"][-1]
+    return "continue" if getattr(last_message, "tool_calls", None) else "end"
+
+graph = StateGraph(AgentState)
+graph.add_node("init_graph", init_graph_node)
+graph.add_node("our_agent", model_call)
+graph.add_node("tools", tool_node)
+
+graph.add_edge(START, "init_graph")
+graph.add_edge("init_graph", "our_agent")
+
+graph.add_conditional_edges(
+    "our_agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "end": END
+    }
+)
+
+graph.add_edge("tools", "our_agent")
+
+app = graph.compile()
+
+user_query = """
+Find all paths Gene -> Anatomy -> Anatomy.
+For Gene nodes, use nodes where name is in [DPP4, GCG, GIPR, GLP1R, GNAI2, GNAS, MME, MMP12, PCSK1, PCSK2, C1QTNF1, GIP].
+Use all edge types.
+Save result to CSV.
+"""
+
+def print_stream(stream):
+    for s in stream:
+        message = s["messages"][-1]
+        if isinstance(message, tuple):
+            print(message)
+        else:
+            message.pretty_print()
+
+inputs = {"messages": [("user", user_query)]}
+print_stream(app.stream(inputs, stream_mode="values"))
+
+
+
+
+
+
+
